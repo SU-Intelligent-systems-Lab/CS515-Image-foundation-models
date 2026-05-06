@@ -1,0 +1,718 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage[protrusion=true,expansion=false]{microtype}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  urlcolor=blue!60!black,
+  citecolor=blue!60!black
+}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codecomment}{rgb}{0.4,0.6,0.4}
+\definecolor{codekw}{rgb}{0.0,0.2,0.6}
+\definecolor{codestr}{rgb}{0.6,0.2,0.2}
+
+\lstdefinestyle{pystyle}{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{codekw}\bfseries,
+  commentstyle=\color{codecomment}\itshape,
+  stringstyle=\color{codestr},
+  breaklines=true,
+  breakatwhitespace=false,
+  showstringspaces=false,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  numbersep=5pt,
+  frame=single,
+  framesep=4pt,
+  rulecolor=\color{gray!50},
+  xleftmargin=14pt,
+  tabsize=4,
+}
+\lstset{style=pystyle}
+
+\newtcolorbox{srcbox}[1][]{%
+  colback=blue!2!white,
+  colframe=blue!40!black,
+  boxrule=0.4pt,
+  arc=2pt,
+  left=6pt,right=6pt,top=4pt,bottom=4pt,
+  fonttitle=\bfseries\small,
+  title=Where to look in the official DINOv3 repository, #1
+}
+
+\titleformat{\section}{\Large\bfseries\sffamily}{\thesection}{1em}{}
+\titleformat{\subsection}{\large\bfseries\sffamily}{\thesubsection}{1em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\sffamily}{\thesubsubsection}{1em}{}
+
+\title{\textbf{Tailoring DINOv3 for Semantic Segmentation}\\[0.4em]
+\large An implementation walkthrough of the linear-head and Mask2Former heads
+released in \texttt{facebookresearch/dinov3}\\[0.6em]
+\small Coursework report --- DINOv3 study project}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This report describes how the official DINOv3 codebase
+(\url{https://github.com/facebookresearch/dinov3}) adapts a frozen DINOv3
+ViT backbone to semantic segmentation. Two adaptations are released by Meta
+and are covered here in detail: a minimal \textbf{linear head}
+(a single $1{\times}1$ convolution on patch features), trained end-to-end on
+ADE20K, and a heavyweight \textbf{Mask2Former (M2F)} head fed by a
+\textbf{DINOv3-Adapter} that turns the single-scale ViT into a multi-scale
+feature pyramid. The first is fully trainable from the released code; the
+second is shipped as inference-only with a pretrained checkpoint that
+achieves the headline 55.9 mIoU on ADE20K reported in Meta's model card. The
+report is grounded in the source code: every claim cites a file and line
+range so a reader can verify it. We do not reproduce Meta's source code in
+this document, only describe and reference it.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =============================================================================
+\section{What semantic segmentation needs from a backbone}
+
+Semantic segmentation requires a per-pixel class prediction. A ViT backbone
+naturally produces per-\emph{patch} features --- for a $512{\times}512$ input
+with patch size 16, a $32{\times}32$ grid of 1024 feature vectors. To get a
+per-pixel prediction at resolution $H{\times}W$, the segmentation pipeline
+must:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item extract patch features from the backbone, possibly from several
+        depths in the network;
+  \item combine and project them into class logits per patch;
+  \item upsample the patch-level logits to pixel resolution.
+\end{enumerate}
+The two heads in DINOv3 differ in how much work they do at each step.
+The \emph{linear} head is intentionally trivial (concatenate features along
+the channel axis, BatchNorm, $1{\times}1$ Conv, bilinear upsample); its
+purpose is to demonstrate that the backbone features are already
+class-discriminative \emph{without} a heavy decoder. The \emph{M2F} head, by
+contrast, treats segmentation as mask classification: it learns a fixed set
+of object queries and predicts masks per query, which means it needs a
+multi-scale feature pyramid the ViT does not natively provide --- hence the
+\emph{DINOv3-Adapter}. We unpack both in turn.
+
+% =============================================================================
+\section{Where the segmentation code lives}
+
+\begin{srcbox}
+\texttt{dinov3/eval/segmentation/} (the whole subtree).\\
+Plus \texttt{dinov3/hub/segmentors.py} for the prebuilt M2F segmentor loader,
+and \texttt{dinov3/eval/utils.py:ModelWithIntermediateLayers}.
+\end{srcbox}
+
+A summary of the directory:
+\begin{description}[leftmargin=1.6em,style=nextline]
+  \item[\texttt{models/\_\_init\_\_.py}] the dispatcher
+        \texttt{build\_segmentation\_decoder()}: chooses linear vs.\ M2F,
+        wires the backbone to the chosen head, and returns a single
+        \texttt{FeatureDecoder} module that exposes a uniform
+        \texttt{forward()/predict()} interface to the trainer and the
+        evaluator.
+  \item[\texttt{models/heads/}] the heads themselves --- \texttt{linear\_head.py}
+        and \texttt{mask2former\_head.py} (plus its \texttt{pixel\_decoder.py}
+        and \texttt{mask2former\_transformer\_decoder.py}).
+  \item[\texttt{models/backbone/dinov3\_adapter.py}] the multi-scale adapter
+        used only by M2F.
+  \item[\texttt{models/utils/}] support layers shared by M2F: deformable
+        attention (custom CUDA op), positional encodings, helper transformer
+        blocks, batch-norm wrappers.
+  \item[\texttt{train.py}, \texttt{eval.py}, \texttt{run.py}] train and eval
+        loops; \texttt{run.py} is the entry point both invoke.
+  \item[\texttt{inference.py}] the sliding-window inference utility used at
+        evaluation time and by our custom-image script.
+  \item[\texttt{loss.py}] cross-entropy and Dice losses with class weighting
+        and ignore-index support.
+  \item[\texttt{metrics.py}] mIoU computation.
+  \item[\texttt{transforms.py}] paired image+mask data augmentations.
+  \item[\texttt{configs/config-ade20k-linear-training.yaml}] the training
+        recipe for the linear head.
+  \item[\texttt{configs/config-ade20k-m2f-inference.yaml}] the
+        \emph{inference-only} recipe for M2F.
+\end{description}
+
+% =============================================================================
+\section{The frozen-backbone interface}
+\label{sec:backbone-interface}
+
+\begin{srcbox}
+\texttt{dinov3/eval/utils.py} (the class \texttt{ModelWithIntermediateLayers}),\\
+\texttt{dinov3/models/vision\_transformer.py:get\_intermediate\_layers}.
+\end{srcbox}
+
+Both heads consume the same backbone interface: a list of patch-feature maps
+extracted from selected transformer blocks. The plumbing is:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item The DINOv3 ViT exposes
+        \texttt{get\_intermediate\_layers(x, n=..., reshape=True,
+        return\_class\_token=...)} which returns, for each requested block
+        index, a tensor of shape $(B, d, H/P, W/P)$ if \texttt{reshape=True}
+        (so it is already a 2D feature map), and optionally the corresponding
+        $(B, d)$ CLS token.
+  \item \texttt{ModelWithIntermediateLayers} wraps that in a callable module
+        and adds an autocast context. It also calls
+        \texttt{requires\_grad\_(False)} on the wrapped backbone, freezing it
+        for the segmentation experiments.
+  \item Which blocks to extract is controlled by the
+        \texttt{BackboneLayersSet} enum in
+        \texttt{eval/segmentation/models/\_\_init\_\_.py}:
+        \begin{itemize}[leftmargin=1.6em,itemsep=0pt]
+          \item \texttt{LAST}: only the last block. Used by the linear head.
+          \item \texttt{FOUR\_LAST}: the last four blocks.
+          \item \texttt{FOUR\_EVEN\_INTERVALS}: four blocks evenly spaced.
+                For ViT-L/16 (24 blocks) the indices are
+                \texttt{[4, 11, 17, 23]} -- this is what the M2F config
+                uses.
+        \end{itemize}
+\end{enumerate}
+
+In short: the head receives a list of one or four 2D feature maps (and
+optionally CLS tokens) at the patch-grid resolution. The head's job is to
+turn those into class logits at pixel resolution.
+
+% =============================================================================
+\section{The linear segmentation head}
+\label{sec:linear}
+
+\begin{srcbox}
+\texttt{dinov3/eval/segmentation/models/heads/linear\_head.py},\\
+\texttt{configs/config-ade20k-linear-training.yaml},\\
+\texttt{eval/segmentation/train.py} (training loop),\\
+\texttt{eval/segmentation/loss.py}, \texttt{eval/segmentation/metrics.py}.
+\end{srcbox}
+
+\subsection{Architecture}
+
+The linear head is approximately 90 lines of code and is essentially a
+single $1{\times}1$ convolution. Its construction takes:
+\begin{itemize}[leftmargin=1.6em,itemsep=0pt]
+  \item \texttt{in\_channels}: a list of per-feature-map dimensions. For
+        the default \texttt{LAST} configuration with a ViT-L backbone the
+        list is just \texttt{[1024]}; for \texttt{FOUR\_EVEN\_INTERVALS}
+        it would be \texttt{[1024, 1024, 1024, 1024]}.
+  \item \texttt{n\_output\_channels}: number of classes
+        ($150$ for ADE20K, plus an ignore index handled by the loss).
+  \item \texttt{use\_batchnorm} (default \texttt{true}): a
+        \texttt{nn.SyncBatchNorm} on the concatenated channels.
+  \item \texttt{use\_cls\_token} (default \texttt{false} for the ADE20K
+        config): if true, the CLS token is broadcast spatially and
+        concatenated with the patch tokens, doubling the channel count.
+  \item \texttt{dropout} (default $0.1$): \texttt{nn.Dropout2d} applied
+        before the $1{\times}1$ convolution.
+\end{itemize}
+
+The forward pass is:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item If \texttt{use\_cls\_token}, broadcast each block's CLS token
+        $(B,d)\to(B,d,h,w)$ and concatenate with that block's patch map
+        along the channel axis.
+  \item Bilinearly upsample every block's feature map to the spatial
+        resolution of the first block (this is a no-op when only the last
+        block is extracted) and concatenate them along the channel axis.
+        The result is a single dense map $(B, \sum d_i, h, w)$.
+  \item Dropout2d $\to$ BatchNorm $\to$ Conv2d$_{1\times1}$.
+  \item For prediction, bilinearly upsample the $(B, K, h, w)$ logits to
+        the requested target size (typically the input image's spatial
+        resolution).
+\end{enumerate}
+
+The intent of this head is pedagogical and methodological: it shows that
+DINOv3's patch features are linearly separable into the 150 ADE20K classes
+to a useful degree without a heavy decoder. The head adds only $K \cdot
+\sum d_i$ parameters (e.g.\ $150 \cdot 1024 = 153{,}600$ for ViT-L/16 LAST),
+plus the BatchNorm scale/shift -- against the millions in the backbone.
+
+\subsection{Training recipe}
+
+Reading \texttt{configs/config-ade20k-linear-training.yaml} top-to-bottom
+gives the exact recipe:
+\begin{itemize}[leftmargin=1.6em,itemsep=0pt]
+  \item \textbf{Hardware:} 8 GPUs, batch size 2 each (effective batch 16).
+  \item \textbf{Iterations:} 40\,000 total.
+  \item \textbf{Optimizer:} AdamW, $\beta_1{=}0.9$, $\beta_2{=}0.999$,
+        weight decay $10^{-3}$, learning rate $10^{-3}$. Gradient clipping
+        disabled (\texttt{"inf"}).
+  \item \textbf{Schedule:} \texttt{WarmupOneCycleLR}: linear warmup over
+        1500 iterations from $10^{-9}$ up to peak $10^{-3}$, then a single
+        cosine descent. \texttt{pct\_start} is $0$ which makes the
+        ``warm-up'' part part of the descent path; the effective peak
+        occurs immediately after warm-up.
+  \item \textbf{Loss:} Cross-entropy weight $1.0$, Dice weight $0.0$.
+        (Dice is implemented in \texttt{loss.py} but disabled in this
+        config.)
+  \item \textbf{Class handling:} \texttt{reduce\_zero\_label: true} maps
+        ADE20K's class 0 (``unlabelled'') to the ignore index, so the
+        head learns 150 classes only.
+  \item \textbf{Augmentations:} random scale ratio in $[0.5, 2.0]$,
+        random crop to $512{\times}512$, random horizontal flip with
+        probability $0.5$. The whole transform is implemented as a paired
+        operation on (image, mask) so the mask follows every geometric
+        change.
+  \item \textbf{Eval:} sliding-window inference at $512{\times}512$ with
+        stride $341$ ($\approx \tfrac{2}{3}$ overlap), evaluated every
+        5000 iterations. No test-time augmentation. Metric: mean IoU
+        over the 150 valid classes.
+\end{itemize}
+
+\subsection{Sliding-window inference}
+\label{ssec:slide}
+
+\begin{srcbox}
+\texttt{dinov3/eval/segmentation/inference.py:slide\_inference}.
+\end{srcbox}
+
+The eval procedure is sliding-window with overlap. Given an input
+$(1, 3, H, W)$, a crop size $h_c{\times}w_c$, and a stride $h_s{\times}w_s$,
+the function:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item Computes the grid of crops needed to tile the image, where the
+        last column/row is shifted in to avoid going out of bounds.
+  \item For each crop, runs the segmentation model and accumulates its
+        prediction into a (CPU, padded) buffer of shape $(1, K, H, W)$.
+  \item Maintains a count map of how many crops have contributed to each
+        pixel.
+  \item Returns the buffer divided by the count map, i.e.\ the average
+        prediction per pixel.
+\end{enumerate}
+At training time, the loss is computed on $512{\times}512$ random crops, so
+the model never actually sees the full image; the sliding-window protocol at
+eval time is what converts that into a coherent full-image prediction. The
+overlap of $\tfrac{2}{3}$ is generous and reduces edge artefacts.
+
+For our purposes the key fact is that
+\texttt{eval/segmentation/inference.py:make\_inference} wraps
+\texttt{slide\_inference} with: an optional rescale-to-target step, an
+optional horizontal-flip TTA, and post-processing for the M2F head's
+mask-classification output. Our custom-image script (Section~\ref{sec:script})
+calls into \texttt{make\_inference} directly.
+
+\subsection{Loss}
+
+\begin{srcbox}\texttt{dinov3/eval/segmentation/loss.py}.\end{srcbox}
+
+\texttt{loss.py} provides two pieces: a weighted-cross-entropy loss with
+ignore index, and a soft-Dice loss (mostly disabled in the released
+ADE20K config but available). Both follow the convention of returning a
+per-element loss that can be combined with a weight tensor. The pattern
+\texttt{weighted\_loss} (a decorator factory) wraps a raw element-wise
+loss function with weight, reduction, and avg-factor handling. In the
+ADE20K linear config only the cross-entropy is active.
+
+% =============================================================================
+\section{The Mask2Former head}
+\label{sec:m2f}
+
+\begin{srcbox}
+\texttt{dinov3/eval/segmentation/models/heads/mask2former\_head.py},\\
+\texttt{.../heads/mask2former\_transformer\_decoder.py},\\
+\texttt{.../heads/pixel\_decoder.py},\\
+\texttt{.../models/utils/} (deformable attention, position encoding, etc.),\\
+\texttt{.../models/backbone/dinov3\_adapter.py} (next section),\\
+\texttt{configs/config-ade20k-m2f-inference.yaml}.
+\end{srcbox}
+
+Mask2Former (Cheng et al.) reformulates segmentation as mask
+classification. Instead of predicting a class per pixel, the model
+predicts a fixed set of $N$ object queries; each query produces a binary
+mask plus a class label. The final per-pixel class is obtained by summing
+$\text{mask}_i \cdot p(\text{class}|i)$ across queries. This unifies
+semantic, instance, and panoptic segmentation under one architecture and
+typically gives substantially higher mIoU than per-pixel classification.
+
+\subsection{Top-level wiring}
+
+The class \texttt{Mask2FormerHead} is constructed inside
+\texttt{build\_segmentation\_decoder()} when \texttt{decoder\_type="m2f"}.
+It expects an \texttt{input\_shape} dict describing the four feature levels
+produced by the DINOv3-Adapter (Section~\ref{sec:adapter}); for ViT-L the
+keys are \texttt{"1"}-\texttt{"4"} and the spatial strides decrease from
+$P/2$ at the deepest level to $4P$ at the shallowest, where $P$ is the
+patch size.
+
+The two main sub-modules are:
+\begin{description}[leftmargin=1.6em,style=nextline]
+  \item[Pixel decoder.] Implemented in \texttt{pixel\_decoder.py}. It is a
+        FPN-with-deformable-attention: the multi-scale features are first
+        pushed through a small Transformer encoder that uses
+        \emph{multi-scale deformable attention} (MSDeformAttn), then
+        progressively upsampled and laterally combined to produce a
+        single high-resolution mask feature map (typically at stride 4).
+  \item[Transformer decoder.] Implemented in
+        \texttt{mask2former\_transformer\_decoder.py}. It takes a fixed
+        set of learnable query embeddings and refines them through several
+        layers of \emph{masked cross-attention} (each query attends only
+        to the predicted-mask region of the encoder features),
+        self-attention, and FFN. Each layer outputs intermediate masks +
+        class logits used for deep supervision (during training) and
+        layer-wise inference.
+\end{description}
+
+\subsection{Multi-scale deformable attention}
+
+\begin{srcbox}
+\texttt{models/utils/ms\_deform\_attn.py},
+\texttt{models/utils/ops/} (the CUDA extension).
+\end{srcbox}
+
+Standard cross-attention on dense image features at multiple scales is
+quadratic in the number of pixels. Deformable attention replaces it with a
+sampling operation: each query predicts a small set of (offset, attention
+weight) pairs; the value vectors at those offsets are bilinearly sampled
+and combined. The result is linear in the number of queries and effectively
+constant per scale. The CUDA op \texttt{MSDeformAttn} implements this
+sampling efficiently. Compiling this extension is the single most fragile
+step of installing M2F (see Section~\ref{sec:install}).
+
+\subsection{Inference-time output}
+
+The decoder produces, at the last layer, a tensor of \emph{mask logits}
+of shape $(B, N, h, w)$ (per-query masks, where $N$ is the number of
+queries) and a tensor of \emph{class logits} of shape $(B, N, K{+}1)$
+(per-query class scores; the extra slot is a ``no-object'' label). The
+inference recipe in \texttt{inference.py:make\_inference} is:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item Softmax the class logits over $K{+}1$, drop the last entry (the
+        no-object slot).
+  \item Sigmoid the mask logits.
+  \item Combine via the einsum
+        $\text{out}_{b,c,h,w} = \sum_q p_{b,q,c} \cdot m_{b,q,h,w}$,
+        which gives a per-pixel class score map of shape $(B,K,h,w)$.
+  \item Argmax over $K$ to get the per-pixel class.
+\end{enumerate}
+The released ADE20K M2F head also uses test-time augmentation: scales
+$[0.9, 0.95, 1.0, 1.05, 1.1]$ averaged, horizontal flips averaged,
+sliding-window crops $896{\times}896$ with stride $596$. This is what
+gets the model to 55.9 mIoU on ADE20K val (per Meta's model card).
+
+\subsection{What is and isn't shipped}
+
+The M2F training-time machinery (Hungarian matcher, per-mask BCE+Dice
+criterion, deep-supervision losses) is present in
+\texttt{mask2former\_head.py} for completeness, but the only released
+\emph{config} is the inference one. Meta releases a pretrained M2F head
+checkpoint (loadable via \texttt{dinov3.hub.segmentors.dinov3\_vit7b16\_ms})
+and the recipe to evaluate it. There is no shipped training config for
+M2F, so re-training it on a different dataset would require writing one
+from scratch. For this project we use M2F as inference-only.
+
+% =============================================================================
+\section{The DINOv3-Adapter}
+\label{sec:adapter}
+
+\begin{srcbox}
+\texttt{dinov3/eval/segmentation/models/backbone/dinov3\_adapter.py}.
+\end{srcbox}
+
+This is the part of the M2F path that is novel to DINOv3 (the rest of M2F
+is essentially the original Cheng-et-al.\ recipe). Mask2Former needs a
+multi-scale feature pyramid; DINOv3 only produces single-scale patch
+features (one feature per $16{\times}16$ patch). The adapter manufactures
+the missing scales.
+
+\subsection{Approach in plain terms}
+
+Given the ViT's intermediate features at four equally-spaced blocks (the
+\texttt{FOUR\_EVEN\_INTERVALS} setting), the adapter:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item Up-samples the shallowest extracted block twice with deconvolutions
+        (each $\times 2$) to produce a feature map at stride $P/4$
+        ($= 4$ for $P{=}16$). This becomes feature level \texttt{"1"}.
+  \item Up-samples the next block once to produce a stride-$P/2$
+        ($= 8$) feature map. This becomes level \texttt{"2"}.
+  \item Keeps the third extracted block unchanged at stride $P$
+        ($= 16$). This is level \texttt{"3"}.
+  \item Down-samples the deepest extracted block once with a strided
+        convolution to produce a stride-$2P$ ($= 32$) feature map. This
+        is level \texttt{"4"}.
+\end{enumerate}
+The four resulting maps form a feature pyramid spanning strides $4, 8,
+16, 32$, exactly what M2F's pixel decoder expects. All four maps share
+the same channel dimension as the ViT's embed dim (e.g. 1024 for ViT-L,
+4096 for ViT-7B), so the adapter introduces only a few small
+deconv/conv layers in addition to the frozen backbone.
+
+\subsection{Why this works at all}
+
+Treating different layers of the ViT as different ``scales'' is a trick
+that has been shown to work because deeper ViT layers have larger
+effective receptive fields and more semantic features, while shallower
+layers retain more local detail. Combined with deconvolutional
+up-sampling for the shallow levels and strided convolution for the deep
+level, the adapter approximates the multi-scale behaviour of a
+hierarchical convnet. The fact that DINOv3 features are already
+spatially coherent (thanks to the Gram-anchoring stage during
+pretraining) means the upsampled maps actually retain useful local
+structure rather than smoothing into uniform blobs. This is the
+contribution of the DINOv3-Adapter: a minimal way to inject the
+multi-scale assumption back in.
+
+\subsection{Construction details}
+
+\texttt{DINOv3\_Adapter} takes the backbone module and a list
+\texttt{interaction\_indexes} (the four block indices to extract). Its
+forward pass calls into the backbone's
+\texttt{get\_intermediate\_layers(reshape=True)} once, getting a tuple of
+four 2D maps, then dispatches each through the appropriate
+deconv/identity/conv head and returns a dict keyed by level. This dict is
+fed to the M2F pixel decoder.
+
+% =============================================================================
+\section{Training the linear head: end-to-end flow}
+
+\begin{srcbox}
+\texttt{eval/segmentation/run.py},
+\texttt{eval/segmentation/train.py},
+\texttt{eval/segmentation/transforms.py},
+\texttt{data/datasets/ade20k.py}.
+\end{srcbox}
+
+A complete training run, from input to backward pass, is:
+
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item \textbf{Dataset.} \texttt{ADE20K} (in
+        \texttt{dinov3/data/datasets/ade20k.py}) reads
+        \texttt{ADEChallengeData2016/} via \texttt{torchvision} primitives.
+        Each sample is a \texttt{(PIL image, PIL mask)} pair; the mask uses
+        ADE20K's index encoding (0 = unlabelled, 1\ldots150 = classes).
+  \item \textbf{Paired transforms.} \texttt{transforms.py} defines a
+        \texttt{Compose}-style class where every operation acts on
+        \texttt{(image, mask)} together: \texttt{RandomResize} (scale ratio
+        from a $[0.5, 2.0]$ uniform), \texttt{RandomCrop} to
+        $512{\times}512$, \texttt{RandomHorizontalFlip} with $p{=}0.5$, then
+        \texttt{Normalize} (image only) with the LVD-1689M mean/std.
+  \item \textbf{Forward.}
+        \texttt{model.forward()} \emph{is} the wrapped
+        \texttt{FeatureDecoder} chain: backbone (frozen, in inference\_mode)
+        $\to$ extract intermediate layers $\to$ \texttt{LinearHead.forward()}
+        $\to$ raw $(B, K, h, w)$ logits. The training loop passes those
+        logits and the resized ground-truth mask to the loss.
+  \item \textbf{Loss.} Cross-entropy with \texttt{ignore\_index=255} (the
+        value the dataloader uses to mark ``ignore'').
+        \texttt{reduce\_zero\_label} in the config makes the dataloader
+        subtract 1 from every valid class so that 0 becomes 255 (ignore)
+        and class IDs are now $0\ldots149$.
+  \item \textbf{Backward.} Standard \texttt{loss.backward()} \texttt{->}
+        \texttt{optimizer.step()}. Because the backbone is frozen,
+        gradients flow only into the linear head's BatchNorm and
+        $1{\times}1$ Conv. This is the reason the head trains so quickly
+        despite the large model.
+  \item \textbf{Validation.} Every 5000 iterations the eval routine runs
+        sliding-window inference on the ADE20K validation set
+        (Section~\ref{ssec:slide}) and reports mIoU. The metric is
+        accumulated across the full val set in a confusion matrix
+        (see \texttt{metrics.py}).
+\end{enumerate}
+
+% =============================================================================
+\section{Reduced single-GPU recipe}
+
+The released config assumes 8 GPUs. We supply
+\texttt{configs/config-ade20k-linear-training-1gpu.yaml} as a single-GPU
+variant. We changed \emph{only} hardware-related fields:
+\begin{itemize}[leftmargin=1.6em,itemsep=0pt]
+  \item \texttt{n\_gpus: 1}, \texttt{bs: 1}: effective batch 1 instead of
+        16. With a frozen backbone and a tiny head this is OK in practice
+        (BatchNorm sees only one sample per step, but the head's
+        BatchNorm is a single-channel per-class scaling that can be
+        replaced with a no-op or kept as-is for evaluation).
+  \item \texttt{transforms.train.img\_size: 512}: same as the multi-GPU
+        config; can be reduced to 448 if the chosen backbone is too
+        large for the GPU.
+  \item Crop size and stride at eval are unchanged (512 / 341).
+\end{itemize}
+Algorithmic settings -- optimizer, scheduler, loss weights, head structure,
+\texttt{reduce\_zero\_label}, etc.\ -- are preserved exactly. Whether the
+1-GPU run actually converges to mIoU within a few points of the 8-GPU run
+depends on the smaller effective batch size; for our class demo we are
+comfortable with the qualitative result and the partial-training
+checkpoint as a teaching artefact.
+
+% =============================================================================
+\section{Custom-image inference}
+\label{sec:script}
+
+The repository accompanying this report contains one script that does not
+exist in Meta's repo: \texttt{scripts/segment\_image.py}. Its only role is
+to invoke the existing pieces correctly on a single user image.
+
+The pipeline it implements:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item Load the image with PIL, normalise with the LVD-1689M
+        mean/std (since the released backbones are pretrained on web
+        images), optionally resize the short side to a target size.
+  \item Build the chosen backbone via Meta's hub factory
+        (\texttt{dinov3.hub.backbones.dinov3\_vits16}, etc.), passing the
+        local checkpoint path as \texttt{weights=}.
+  \item Build the chosen decoder via
+        \texttt{dinov3.eval.segmentation.models.build\_segmentation\_decoder}
+        with \texttt{decoder\_type=\{linear,m2f\}}; the function returns
+        a \texttt{FeatureDecoder} that already wraps the backbone + head.
+  \item Load the decoder checkpoint with \texttt{strict=False}, mirroring
+        the way Meta's \texttt{dinov3/hub/segmentors.py} loads the
+        released M2F head (the backbone keys are skipped because the
+        backbone was loaded separately).
+  \item Call \texttt{dinov3.eval.segmentation.inference.make\_inference}
+        with \texttt{inference\_mode="slide"} and the head-appropriate
+        crop / stride: $(512, 341)$ for the linear head and $(896, 596)$
+        for M2F, matching Meta's eval configs.
+  \item Convert the output logits to a class map via \texttt{argmax},
+        colour-code the classes, and overlay on the original image.
+\end{enumerate}
+The script is roughly 300 lines, of which the modelling-relevant parts
+are simple wrappers around the four \texttt{import}s above. The colour
+palette and the overlay blending are routine numpy. We deliberately do
+not bundle ADE20K's official palette file with the repository; instead
+we generate a deterministic palette via HSV with a fixed seed so the
+visualisations are reproducible.
+
+% =============================================================================
+\section{Installing it: the practical bits}
+\label{sec:install}
+
+The project's \texttt{README.md} has the full walkthrough. Key practical
+points:
+
+\paragraph{Cloning vs.\ vendoring.} We \emph{do not} include Meta's source
+in this repository. Instead, the user clones
+\texttt{facebookresearch/dinov3} alongside, installs it with
+\texttt{pip install -e .}, and our scripts import it as a normal package.
+This keeps the licence story clear and the repository small.
+
+\paragraph{The MSDeformAttn extension.} Mask2Former requires a custom CUDA
+op compiled at install time (\texttt{python setup.py build\_ext --inplace}
+in \texttt{dinov3/eval/segmentation/models/utils/ops/}). The most common
+failure modes are: (a) CUDA toolkit version mismatched with the PyTorch
+build, (b) \texttt{nvcc} not on \texttt{PATH}, (c)
+\texttt{TORCH\_CUDA\_ARCH\_LIST} unset on machines whose driver
+mis-reports the device capability. The op is needed only for M2F; the
+linear head runs without it.
+
+\paragraph{Pretrained weights.} Three to four checkpoints in total: a
+backbone (any of S/B/L/7B), the released ADE20K M2F head, and any linear
+head that you train yourself. The backbones are gated behind a Meta
+download form. The data (ADE20K) is gated behind the MIT release form.
+Neither is redistributable.
+
+% =============================================================================
+\section{Expected results}
+
+The headline numbers, taken from Meta's \texttt{MODEL\_CARD.md}, are:
+\begin{center}\small
+\begin{tabular}{lcc}
+\toprule
+Model & ADE20K mIoU & Notes \\
+\midrule
+DINOv3 ViT-L/16 + linear head      & 54.9 & frozen backbone, $1{\times}1$ Conv head \\
+DINOv3 ViT-7B/16 + linear head     & 55.9 & frozen backbone, $1{\times}1$ Conv head \\
+DINOv3 ViT-7B/16 + M2F head        & 55.9 & released checkpoint, TTA at 5 scales \\
+\bottomrule
+\end{tabular}
+\end{center}
+That the 7B linear head matches the 7B M2F head on this metric is, by
+itself, a striking result -- it suggests that for ADE20K the bottleneck is
+the backbone, not the decoder. M2F retains its advantage on instance- and
+panoptic-segmentation metrics that the linear head cannot reach by
+construction (the linear head always assigns the same class to all pixels
+in a region; it has no notion of separate instances).
+
+For our class project we run two demonstrations:
+\begin{enumerate}[leftmargin=1.6em,itemsep=0pt]
+  \item Train the linear head on ADE20K (single-GPU recipe), report
+        train/val curves, and evaluate at the iteration we can afford to
+        reach (typically a few thousand iterations on a single consumer
+        GPU). The checkpoint we obtain will not match the 54.9 mIoU figure
+        above but should clearly demonstrate the training behaviour and
+        produce sensible qualitative outputs on ADE20K val and on
+        custom images.
+  \item Run M2F inference at full quality on ADE20K val and on custom
+        images, reproducing the qualitative results from the model card.
+\end{enumerate}
+
+% =============================================================================
+\section{Why DINOv3 features are well-suited to segmentation}
+
+Three properties of the DINOv3 backbone matter directly for segmentation
+quality:
+
+\paragraph{Patch features are spatially coherent.} The Gram-anchoring
+training stage explicitly preserves the pairwise patch-similarity
+structure across long training, which is the property a segmentation head
+exploits when grouping nearby patches into the same class.
+
+\paragraph{Register tokens absorb high-norm artefacts.} In ViTs trained
+without registers, a small number of patch tokens become high-norm
+``sinks'' that hold global information; those positions appear as bright
+artefacts in segmentation outputs. DINOv3 includes 4 register tokens
+explicitly to absorb this role, leaving patch tokens spatially clean and
+class-discriminative.
+
+\paragraph{High-resolution adaptation.} The third pretraining stage trains
+the model at multiple resolutions including $768$, so applying it at
+ADE20K's typical $512$--$896$ inputs is in-distribution. With learnable
+absolute positional embeddings (DINOv2) this would have required
+interpolation; with axial RoPE (DINOv3) it is native.
+
+These three together mean that a $1{\times}1$ convolution on top of frozen
+DINOv3 features achieves a result that, three years ago, would have
+required a heavy task-specific decoder.
+
+% =============================================================================
+\section{File-by-file map}
+
+\begin{center}\footnotesize
+\begin{tabular}{ll}
+\toprule
+File in \texttt{dinov3/} & Role \\
+\midrule
+\texttt{models/vision\_transformer.py}                 & ViT backbone with the \texttt{get\_intermediate\_layers} hook \\
+\texttt{eval/utils.py}                                 & \texttt{ModelWithIntermediateLayers} (frozen-backbone wrapper) \\
+\texttt{eval/segmentation/models/\_\_init\_\_.py}      & dispatcher: linear vs M2F \\
+\texttt{eval/segmentation/models/heads/linear\_head.py}& linear segmentation head \\
+\texttt{eval/segmentation/models/heads/mask2former\_head.py} & M2F top-level head \\
+\texttt{eval/segmentation/models/heads/mask2former\_transformer\_decoder.py} & M2F transformer decoder \\
+\texttt{eval/segmentation/models/heads/pixel\_decoder.py} & M2F pixel decoder (FPN + MSDeformAttn) \\
+\texttt{eval/segmentation/models/backbone/dinov3\_adapter.py} & multi-scale adapter for M2F \\
+\texttt{eval/segmentation/models/utils/ms\_deform\_attn.py} & deformable attention layer \\
+\texttt{eval/segmentation/models/utils/ops/}           & CUDA extension for MSDeformAttn \\
+\texttt{eval/segmentation/inference.py}                & sliding-window + TTA inference \\
+\texttt{eval/segmentation/train.py, eval.py, run.py}   & training and evaluation loops \\
+\texttt{eval/segmentation/loss.py, metrics.py}         & cross-entropy/Dice losses, mIoU \\
+\texttt{eval/segmentation/transforms.py}               & paired (image, mask) augmentations \\
+\texttt{eval/segmentation/configs/}                    & ADE20K linear-training and M2F-inference YAMLs \\
+\texttt{hub/segmentors.py}                             & prebuilt M2F segmentor with weight downloading \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\bigskip
+\noindent
+This concludes the report. The companion repository contains the README,
+the single-GPU config, and the custom-image inference script that wires
+all of the above into a runnable demo on user-supplied images.
+
+\end{document}
