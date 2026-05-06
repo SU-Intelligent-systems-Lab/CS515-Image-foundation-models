@@ -1,0 +1,51 @@
+# =============================================================================
+# Feature exploration of a pretrained DINOv2 backbone.
+# Used by notebook 01 and by scripts/run_feature_analysis.py.
+#
+# All experiments in this config run on FROZEN weights: no gradient updates.
+# =============================================================================
+
+experiment:
+  name: feature_analysis_dinov2
+  seed: 0
+  output_dir: results/figures/feature_analysis
+
+# ---------------- Model ----------------
+model:
+  # Any HuggingFace DINOv2 id will work. ViT-S is fastest; ViT-B is the report default.
+  source: huggingface
+  hf_id: facebook/dinov2-base           # {dinov2-small, dinov2-base, dinov2-large, dinov2-giant}
+  image_size: 224                       # DINOv2 eval resolution
+
+# ---------------- Data ----------------
+data:
+  # For quantitative probes. Uses ImageNet-100 if available, else CIFAR-100.
+  eval_dataset: cifar100
+  root: ${env:DATASETS_DIR}/cifar100
+  download: true
+  num_workers: 4
+  batch_size: 128
+
+# ---------------- Qualitative probes ----------------
+qualitative:
+  # Local images saved under docs/ for the report; leave empty to use dataset samples.
+  sample_images:
+    - docs/samples/dog.jpg
+    - docs/samples/cathedral.jpg
+    - docs/samples/street.jpg
+  n_fallback_samples: 6                  # if sample_images is empty / missing
+
+# ---------------- Quantitative probes ----------------
+quantitative:
+  run_knn: true
+  run_linear_probe: false                # set true for better numbers (slower)
+  knn_k: 20
+  knn_temperature: 0.07
+
+# ---------------- Output paths ----------------
+output:
+  attention_figure: results/figures/feature_analysis/attention_maps.png
+  pca_figure: results/figures/feature_analysis/patch_pca.png
+  similarity_figure: results/figures/feature_analysis/patch_similarity.png
+  layerwise_figure: results/figures/feature_analysis/layerwise_knn.png
+  table_csv: results/tables/feature_analysis_summary.csv

@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dinovpr"
+version = "0.1.0"
+description = "DINO vision foundation models and their adaptation to Visual Place Recognition (VPR)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+  {name = "[Your Name]", email = "[your.email@domain]"}
+]
+keywords = ["self-supervised learning", "vision transformer", "DINO", "DINOv2",
+            "visual place recognition", "VPR", "foundation models"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+  # Core
+  "torch>=2.1",
+  "torchvision>=0.16",
+  "numpy>=1.24",
+  "pillow>=10.0",
+  # Models / pretrained
+  "transformers>=4.40",
+  "timm>=0.9.12",
+  # Training
+  "einops>=0.7",
+  "tqdm>=4.66",
+  # Configuration / logging
+  "pyyaml>=6.0",
+  "tensorboard>=2.15",
+  # Analysis / plotting
+  "matplotlib>=3.8",
+  "scikit-learn>=1.3",
+  "scipy>=1.11",
+  # Notebook support
+  "jupyterlab>=4.0",
+  "ipywidgets>=8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1",
+  "black>=23.12",
+  "ruff>=0.1.15",
+  "mypy>=1.8",
+]
+
+[project.scripts]
+dinovpr-train-mini = "scripts.run_mini_dino:main"
+dinovpr-train-vpr  = "scripts.run_vpr_train:main"
+dinovpr-eval-vpr   = "scripts.run_vpr_eval:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.setuptools.package-dir]
+"dinovpr" = "src"
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"

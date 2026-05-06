@@ -1,0 +1,1009 @@
+% =============================================================================
+%  Project Report: DINO Vision Foundation Models
+%  Chapters 1-3: Introduction, DINO Family Deep Dive, Feature Analysis
+%  Author: [Your Name]
+%  Course: [Course Name]
+% =============================================================================
+
+\documentclass[11pt,a4paper]{article}
+
+% ---------- Packages ----------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[english]{babel}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{float}
+% microtype disabled: requires scalable fonts not available in minimal TeX install
+\usepackage{enumitem}
+\usepackage[hidelinks,colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black]{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,shapes.geometric,calc}
+\usepackage{caption}
+\usepackage{titlesec}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+% ---------- Math shortcuts ----------
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\KL}{\mathrm{KL}}
+\newcommand{\softmax}{\mathrm{softmax}}
+\newcommand{\CE}{\mathrm{CE}}
+\newcommand{\vect}[1]{\mathbf{#1}}
+\newcommand{\trans}{^{\top}}
+\newcommand{\loss}{\mathcal{L}}
+\newcommand{\thetaS}{\theta_{s}}
+\newcommand{\thetaT}{\theta_{t}}
+\newcommand{\gS}{g_{\thetaS}}
+\newcommand{\gT}{g_{\thetaT}}
+\newcommand{\PS}{P_{s}}
+\newcommand{\PT}{P_{t}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+\newcommand{\argmax}{\operatorname*{arg\,max}}
+\newcommand{\TODO}[1]{\textcolor{red}{\textbf{[TODO: #1]}}}
+\newcommand{\placeholder}[1]{\textcolor{gray}{\emph{[Placeholder: #1]}}}
+
+% ---------- Title ----------
+\title{\vspace{-2em}
+\textbf{Self-Supervised Vision Foundation Models:\\
+A Study of the DINO Family and Its Adaptation to\\
+Visual Place Recognition}\\[0.5em]
+\large Project Report --- Part I: Theoretical Foundations\\
+\small (Chapters 1--3)}
+
+\author{[Your Name]\\
+\small [Your Affiliation / Course] \\
+\small \texttt{[your.email@domain]}}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report presents a study of the DINO family of self-supervised vision
+foundation models (DINO, DINOv2, DINOv3) and their application to the Visual
+Place Recognition (VPR) task. Part~I of the report, contained in this document,
+provides the theoretical groundwork. Chapter~\ref{ch:intro} situates DINO
+within the broader landscape of foundation models and motivates
+self-supervised learning for computer vision. Chapter~\ref{ch:dino} presents
+a detailed, graduate-level treatment of the DINO family, including its
+architecture, self-distillation objective, centering and sharpening mechanisms
+for collapse avoidance, multi-crop augmentation, the patch-level iBOT
+objective, the KoLeo regularizer, and the Gram anchoring technique introduced
+in DINOv3. Chapter~\ref{ch:analysis} describes the feature-analysis study we
+conduct on the pretrained DINOv2 backbone, covering qualitative and
+quantitative probes of its representations; results from this chapter are
+obtained in Part~II of the project and are included here as placeholders.
+Parts~II and III will cover a minimum-viable reimplementation of the DINO
+training loop, the VPR adaptation experiments, and the empirical comparison
+of adaptation strategies.
+\end{abstract}
+
+\tableofcontents
+\newpage
+
+% =============================================================================
+% CHAPTER 1: INTRODUCTION
+% =============================================================================
+\section{Introduction}
+\label{ch:intro}
+
+\subsection{From Supervised to Self-Supervised Vision}
+
+For the better part of the past decade, progress in computer vision has been
+driven by the paradigm of \emph{supervised pretraining}: train a deep network
+on a large, human-labeled dataset such as ImageNet-1k~\citep{russakovsky2015imagenet}
+and transfer its weights to downstream tasks. This recipe has been remarkably
+effective, but it carries three well-known limitations.
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Annotation cost.} Obtaining clean, class-balanced labels for
+  millions of images is expensive, slow, and often impossible in specialized
+  domains (medical imaging, remote sensing, industrial inspection).
+  \item \textbf{Label-induced bias.} The learned representation is shaped by
+  the particular taxonomy of the labeling scheme. Features optimized for
+  1000-way ImageNet classification are not necessarily ideal for, say,
+  segmentation, depth estimation, or instance-level retrieval.
+  \item \textbf{Scale ceiling.} Labeled datasets saturate in size at a scale
+  that is orders of magnitude below the quantity of \emph{unlabeled} visual
+  data available on the Internet.
+\end{enumerate}
+
+A parallel development in natural language processing --- beginning with word
+embeddings~\citep{mikolov2013distributed} and culminating in modern large
+language models --- demonstrated that task-agnostic representations trained
+with \emph{self-supervised} objectives on massive unlabeled corpora can
+serve as powerful substrates for nearly any downstream task. The
+\emph{foundation model}~\citep{bommasani2021opportunities} paradigm
+formalises this observation: one pretrains a large network on a broad data
+distribution once, then adapts it to a multitude of downstream tasks with
+minimal additional compute or labeled data.
+
+Replicating this success in computer vision required two things: a training
+objective that does not rely on labels, and an architecture that benefits
+from data at very large scale. Vision Transformers
+(ViTs)~\citep{dosovitskiy2021image} provided the latter. The former has been
+the subject of active research, yielding contrastive methods
+(SimCLR~\citep{chen2020simple}, MoCo~\citep{he2020momentum}),
+clustering-based methods (SwAV~\citep{caron2020unsupervised}), predictive
+methods (BYOL~\citep{grill2020bootstrap}), and masked-reconstruction methods
+(MAE~\citep{he2022masked}, BEiT~\citep{bao2021beit}). The DINO
+family~\citep{caron2021emerging, oquab2024dinov2, simeoni2025dinov3} combines
+elements from several of these and represents, at the time of writing, one
+of the most successful attempts at a general-purpose, purely self-supervised
+vision foundation model.
+
+\subsection{Why DINO?}
+
+Three properties single out the DINO family for our study.
+
+\paragraph{Emergent semantic structure without labels.}
+The original DINO paper~\citep{caron2021emerging} observed that
+self-supervised Vision Transformers, trained only with a self-distillation
+objective, spontaneously develop attention maps that segment the salient
+object from the background --- an \emph{emergent} property not explicitly
+optimized for. This is not merely cosmetic: it suggests that the learned
+representation encodes object-level semantics in a form directly accessible
+to downstream heads without further supervision.
+
+\paragraph{State-of-the-art dense features.}
+DINOv2~\citep{oquab2024dinov2} and, more markedly, DINOv3~\citep{simeoni2025dinov3}
+produce \emph{patch-level} features of exceptional quality. On benchmarks
+like ADE20K semantic segmentation and NYU depth estimation, a frozen DINOv2
+or DINOv3 backbone combined with a simple linear probe already reaches
+competitive performance --- matching or exceeding specialized, fully
+supervised architectures that were explicitly trained for the task.
+
+\paragraph{A clear evolutionary arc.}
+DINO $\to$ DINOv2 $\to$ DINOv3 constitutes a cleanly documented research
+progression: DINO introduced the self-distillation core; DINOv2 added the
+patch-level iBOT~\citep{zhou2021ibot} objective, the KoLeo
+regularizer~\citep{sablayrolles2018spreading}, Sinkhorn--Knopp centering,
+and scaled the data from ImageNet to 142M curated images (LVD-142M);
+DINOv3 scaled further to 1.7B images and a 7B-parameter ViT, introduced
+Gram anchoring to prevent the degradation of patch features during long
+training, replaced learnable positional embeddings with RoPE, and added a
+high-resolution refinement phase. Each step addresses a specific, identified
+weakness of its predecessor, making the family an excellent case study in
+how foundation models are actually engineered.
+
+\subsection{Visual Place Recognition: The Downstream Task}
+
+Visual Place Recognition (VPR) is the task of identifying the geographic
+location of a query image by retrieving the most similar image from a
+geo-tagged reference database~\citep{lowry2015visual}. It is a core
+component of robot localization, autonomous driving, and augmented reality,
+and is typically evaluated on large-scale benchmarks such as
+Pitts30k~\citep{torii2013visual}, Mapillary Street-Level Sequences
+(MSLS)~\citep{warburg2020mapillary}, Tokyo 24/7~\citep{torii201524},
+and Nordland~\citep{sunderhauf2013we}. The evaluation metric is usually
+Recall@$N$: a query is considered correctly localized if at least one of
+the top-$N$ retrieved references lies within a threshold distance (typically
+25\,m) of the query's ground-truth pose.
+
+VPR is an attractive downstream task for our study for three reasons:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{It stresses semantic robustness.} A correct match must be
+  made despite seasonal changes, illumination shifts, viewpoint variation,
+  and dynamic occluders (pedestrians, vehicles). This is exactly the kind of
+  representation-quality test on which strong pretraining shines.
+  \item \textbf{It has a clean global--local structure.} State-of-the-art VPR
+  systems typically combine a \emph{global descriptor} for coarse retrieval
+  with \emph{local descriptors} for geometric re-ranking. DINO's ability to
+  produce both [CLS]-level global features and high-quality patch-level
+  local features makes it a natural backbone for this structure.
+  \item \textbf{The recent literature is explicitly built around DINO.}
+  Several state-of-the-art VPR methods --- SelaVPR~\citep{lu2024selavpr},
+  SelaVPR++~\citep{lu2025selavprpp}, CricaVPR~\citep{lu2024cricavpr},
+  EffoVPR~\citep{tzachor2024effovpr}, SALAD~\citep{izquierdo2024optimal} ---
+  use DINOv2 as their backbone and differ primarily in how they
+  \emph{adapt} it. This gives us a well-defined comparison space for our
+  experiments.
+\end{enumerate}
+
+\subsection{Contributions and Report Structure}
+
+This project contributes, across its three parts:
+
+\begin{enumerate}[leftmargin=*,label=(\arabic*)]
+  \item A detailed graduate-level exposition of the DINO family's
+  mathematical foundations and training mechanisms
+  (Chapter~\ref{ch:dino}).
+  \item An empirical feature-analysis study of the publicly released DINOv2
+  backbone, covering attention-map visualization, principal-component
+  analysis of patch features, and non-parametric probes such as kNN
+  classification and zero-shot segmentation
+  (Chapter~\ref{ch:analysis}).
+  \item A minimum-viable from-scratch reimplementation of the DINO
+  self-distillation training loop on a small dataset, serving as a
+  pedagogical demonstration that the core mechanism is understood
+  (Part~II, Chapter~4).
+  \item A survey and taxonomy of adaptation techniques for vision
+  foundation models (Part~II, Chapter~5).
+  \item An implementation and empirical comparison of multiple VPR
+  adaptation strategies --- a frozen-backbone baseline with GeM pooling,
+  a LoRA-adapted variant, and a training-free EffoVPR-style reranker ---
+  evaluated on Pitts30k and MSLS (Part~III, Chapters~6--7).
+  \item A discussion of results, limitations, and directions for future
+  work (Part~III, Chapter~8).
+\end{enumerate}
+
+The accompanying GitHub repository~\footnote{\url{https://github.com/[your-username]/dino-vpr-project}}
+contains all implementation code, configuration files, training logs,
+trained checkpoints, and notebooks, organized so that a reader can
+reproduce every experiment reported here.
+
+% =============================================================================
+% CHAPTER 2: THE DINO FAMILY
+% =============================================================================
+\newpage
+\section{The DINO Family: Architecture, Objectives, and Training}
+\label{ch:dino}
+
+This chapter presents a self-contained, graduate-level derivation of the
+DINO family of models. We begin with the Vision Transformer backbone
+(Section~\ref{sec:vit}), then derive the DINO self-distillation objective
+and its stabilization mechanisms (Section~\ref{sec:dino}), cover the
+additions introduced in DINOv2 (Section~\ref{sec:dinov2}), and conclude
+with the contributions of DINOv3 (Section~\ref{sec:dinov3}).
+
+\subsection{The Vision Transformer Backbone}
+\label{sec:vit}
+
+The DINO family uses the Vision Transformer~\citep{dosovitskiy2021image}
+as its backbone. We briefly review it to fix notation.
+
+Given an input image $\vect{x} \in \R^{H \times W \times 3}$, ViT splits it
+into a grid of non-overlapping patches of size $P \times P$ (typically
+$P = 14$ or $16$), yielding $N = HW/P^{2}$ patches
+$\{\vect{x}_{p}^{(i)}\}_{i=1}^{N}$. Each patch is flattened and linearly
+projected to a $d$-dimensional token embedding via a learned projection
+$\vect{E} \in \R^{d \times 3P^{2}}$. A learnable \texttt{[CLS]} token
+$\vect{x}_{\text{cls}} \in \R^{d}$ is prepended, and a learned (DINO, DINOv2)
+or rotary (DINOv3) positional encoding is added. The resulting sequence
+\begin{equation}
+\vect{z}_{0} \;=\; [\vect{x}_{\text{cls}};\;\vect{E}\vect{x}_{p}^{(1)};\;\ldots;\;\vect{E}\vect{x}_{p}^{(N)}] + \vect{E}_{\text{pos}}
+\in \R^{(N+1)\times d}
+\end{equation}
+is passed through $L$ stacked Transformer blocks, each combining multi-head
+self-attention (MHSA) and a position-wise feed-forward network (FFN) with
+pre-LayerNorm and residual connections:
+\begin{align}
+\vect{z}_{\ell}' &= \vect{z}_{\ell-1} + \mathrm{MHSA}\bigl(\mathrm{LN}(\vect{z}_{\ell-1})\bigr), \\
+\vect{z}_{\ell}  &= \vect{z}_{\ell}'   + \mathrm{FFN}\bigl(\mathrm{LN}(\vect{z}_{\ell}')\bigr), \quad \ell = 1,\ldots,L.
+\end{align}
+Multi-head self-attention computes, for each of $H$ heads,
+queries, keys, values $\vect{Q},\vect{K},\vect{V} \in \R^{(N+1)\times d_{h}}$
+(where $d_{h}=d/H$) via linear projections of the input, and outputs
+\begin{equation}
+\mathrm{Attention}(\vect{Q},\vect{K},\vect{V}) =
+\softmax\!\left(\frac{\vect{Q}\vect{K}\trans}{\sqrt{d_{h}}}\right)\vect{V}.
+\end{equation}
+The final output $\vect{z}_{L}$ provides two kinds of representations
+used downstream:
+\begin{itemize}[leftmargin=*]
+  \item the \texttt{[CLS]} token $\vect{z}_{L}^{[\text{cls}]} \in \R^{d}$, a
+  global image descriptor, and
+  \item the patch tokens $\{\vect{z}_{L}^{(i)}\}_{i=1}^{N}$, a set of local
+  dense features, one per patch.
+\end{itemize}
+
+For brevity we write $f_{\theta}(\vect{x}) = \vect{z}_{L}^{[\text{cls}]}$
+when focusing on the global descriptor.
+
+\subsection{DINO: Self-Distillation with No Labels}
+\label{sec:dino}
+
+\subsubsection{The Self-Distillation Framework}
+
+DINO~\citep{caron2021emerging} learns representations by matching the output
+distribution of a \emph{student} network to that of a \emph{teacher} network,
+where both networks share the same architecture but have different parameters.
+Crucially, no labels are used; the teacher's output plays the role of a
+soft target.
+
+Let $\gS$ and $\gT$ denote the student and teacher respectively, each
+consisting of a backbone $f$ (a ViT) followed by a projection head $h$:
+\begin{equation}
+g_{\theta}(\vect{x}) = h_{\theta}\bigl(f_{\theta}(\vect{x})\bigr) \in \R^{K},
+\end{equation}
+where $K$ is the output dimension of the projection head (typically
+$K = 65{,}536$ in the original DINO paper). The projection head is a 3-layer
+MLP with hidden dimension $2048$, GELU activations, followed by $\ell_{2}$
+normalisation and a weight-normalised linear layer that produces the
+$K$-dimensional output.
+
+Both networks transform their outputs into probability distributions over
+the $K$-dimensional prototype space via temperature-scaled softmax:
+\begin{align}
+\PS(\vect{x})^{(k)} &= \frac{\exp\bigl(\gS(\vect{x})^{(k)}/\tau_{s}\bigr)}
+                            {\sum_{j=1}^{K}\exp\bigl(\gS(\vect{x})^{(j)}/\tau_{s}\bigr)}, \\
+\PT(\vect{x})^{(k)} &= \frac{\exp\bigl((\gT(\vect{x})^{(k)}-c^{(k)})/\tau_{t}\bigr)}
+                            {\sum_{j=1}^{K}\exp\bigl((\gT(\vect{x})^{(j)}-c^{(j)})/\tau_{t}\bigr)},
+\end{align}
+where $\tau_{s},\tau_{t} > 0$ are student and teacher temperatures
+respectively, and $\vect{c} \in \R^{K}$ is the \emph{center} vector used
+to avoid mode collapse (derived in
+Section~\ref{sec:collapse}). Notably $\tau_{t} \ll \tau_{s}$, which
+\emph{sharpens} the teacher's distribution (making it more peaked) while
+the student's distribution remains relatively smooth --- we will see
+shortly why this asymmetry is essential.
+
+Given two augmented views $\vect{x}_{1},\vect{x}_{2}$ of the same image,
+the DINO loss is the cross-entropy between the teacher's distribution on
+one view and the student's distribution on the other:
+\begin{equation}
+\loss_{\text{DINO}}(\vect{x}_{1},\vect{x}_{2}) =
+- \sum_{k=1}^{K} \PT(\vect{x}_{1})^{(k)}\, \log \PS(\vect{x}_{2})^{(k)}.
+\label{eq:dino-loss}
+\end{equation}
+
+\subsubsection{Teacher as EMA of the Student}
+
+A crucial design choice in DINO is that the teacher is not a separately
+trained network: it is constructed as an \emph{exponential moving average}
+(EMA) of the student's weights. At each iteration $t$,
+\begin{equation}
+\thetaT^{(t)} \leftarrow \lambda\, \thetaT^{(t-1)} + (1-\lambda)\, \thetaS^{(t)},
+\label{eq:ema}
+\end{equation}
+where $\lambda \in [0,1)$ is a momentum coefficient, typically scheduled
+from $0.996$ to $1.0$ over the course of training. No gradient flows into
+the teacher; its parameters are updated only through Eq.~\eqref{eq:ema}.
+This ``momentum teacher'' strategy originated in
+MoCo~\citep{he2020momentum} and BYOL~\citep{grill2020bootstrap}, and serves
+two purposes:
+\begin{enumerate}[leftmargin=*]
+  \item It provides a \emph{stable}, slowly-evolving target for the
+  student. If the target changed as rapidly as the student's own weights,
+  training would be chasing a moving target and likely diverge.
+  \item It implements a form of \emph{self-ensembling}: the EMA is
+  effectively an ensemble of past student snapshots, whose averaged
+  representations are empirically higher-quality than any single snapshot.
+\end{enumerate}
+\citet{caron2021emerging} show that the teacher consistently outperforms
+the student throughout training --- a property they call the ``teacher is
+better'' effect --- even though the teacher has no independent learning
+signal.
+
+\subsubsection{Mode Collapse and its Prevention}
+\label{sec:collapse}
+
+The loss in Eq.~\eqref{eq:dino-loss} admits trivial solutions:
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Uniform collapse:} $\PT$ and $\PS$ are both the uniform
+  distribution over $K$. The loss reaches $\log K$ and training plateaus
+  with useless features.
+  \item \textbf{Dimensional collapse:} $\PT$ (and consequently $\PS$) places
+  all mass on a single dimension $k^{*}$, independent of the input. The loss
+  is zero (perfectly matched) but the representation carries no information
+  about the input.
+\end{enumerate}
+Unlike contrastive methods, which prevent collapse through negative pairs,
+and unlike BYOL, which uses an asymmetric predictor head, DINO prevents
+collapse using only two operations on the teacher's output: \emph{centering}
+and \emph{sharpening}.
+
+\paragraph{Centering.} The center $\vect{c} \in \R^{K}$ subtracted from the
+teacher's pre-softmax logits is itself updated as an EMA over the batch:
+\begin{equation}
+\vect{c} \;\leftarrow\; m\,\vect{c} \;+\; (1-m)\, \frac{1}{B}\sum_{i=1}^{B}\gT(\vect{x}_{i}),
+\label{eq:center}
+\end{equation}
+where $m \in [0,1)$ (typically $m=0.9$) and $B$ is the batch size.
+Intuitively, $\vect{c}$ tracks the running mean of the teacher's outputs;
+subtracting it prevents any single dimension from persistently dominating
+the softmax --- it pushes the distribution toward uniformity.
+
+\paragraph{Sharpening.} Setting $\tau_{t} \ll \tau_{s}$ sharpens the
+teacher's softmax, pulling its distribution toward a one-hot spike on the
+most active dimension --- the opposite of what centering does.
+
+\paragraph{Why the combination works.}
+\citet{caron2021emerging} provide a concise justification by decomposing the
+cross-entropy loss~\eqref{eq:dino-loss} as
+\begin{equation}
+\loss_{\text{DINO}} = H(\PT) + \KL(\PT \,\|\, \PS),
+\end{equation}
+where $H(\cdot)$ is the Shannon entropy and $\KL$ the Kullback--Leibler
+divergence. The learning signal for the student comes entirely from the KL
+term; the entropy term is determined by $\PT$ alone. If
+$H(\PT) \to 0$ (sharp collapse), the teacher becomes deterministic and
+further learning is still possible but the representation has collapsed.
+If $H(\PT) \to \log K$ (uniform collapse), $\PT$ carries no information.
+Centering and sharpening exert \emph{opposite} pressures on $H(\PT)$: centering
+raises it, sharpening lowers it. Their balance keeps
+$H(\PT)$ at an intermediate, informative value where the KL term --- and
+hence the learning signal --- remains nontrivial throughout training.
+
+\subsubsection{Multi-Crop Augmentation}
+\label{sec:multicrop}
+
+Rather than feeding a single pair of views to both networks, DINO uses a
+\emph{multi-crop} strategy~\citep{caron2020unsupervised}. From each image,
+two \emph{global} crops $(v_{1}^{g}, v_{2}^{g})$ of size $224\times 224$
+(covering $> 50\%$ of the image area) and $M$ \emph{local} crops
+$(v_{1}^{\ell},\ldots,v_{M}^{\ell})$ of size $96\times 96$ (covering
+$< 50\%$) are extracted. The teacher processes only the global crops; the
+student processes both. The full DINO loss is then
+\begin{equation}
+\loss_{\text{DINO}}^{\text{mc}} \;=\;
+\sum_{v^{g}\in\{v_{1}^{g},v_{2}^{g}\}}\;\;
+\sum_{\substack{v' \in V \\ v' \neq v^{g}}}
+  \CE\!\bigl(\PT(v^{g}) \,\|\, \PS(v')\bigr),
+\label{eq:multicrop}
+\end{equation}
+where $V = \{v_{1}^{g},v_{2}^{g},v_{1}^{\ell},\ldots,v_{M}^{\ell}\}$ is
+the full crop set and $\CE$ denotes cross-entropy.
+Conceptually, this forces the student to predict a global view's embedding
+from a local view of the same image --- a ``local-to-global'' correspondence
+objective that yields representations encoding strong part--whole relations.
+
+\subsubsection{DINO Training Algorithm in Full}
+
+\begin{algorithm}[H]
+\caption{DINO training (one iteration)}
+\label{alg:dino}
+\begin{algorithmic}[1]
+\Require Image batch $\{\vect{x}_{i}\}_{i=1}^{B}$; student $\thetaS$;
+         teacher $\thetaT$; center $\vect{c}$; temperatures $\tau_{s},\tau_{t}$;
+         momenta $\lambda,m$; local crop count $M$.
+\For{$i=1,\ldots,B$}
+  \State Sample two global crops $v_{1,i}^{g},v_{2,i}^{g}$ and $M$ local
+         crops $v_{1,i}^{\ell},\ldots,v_{M,i}^{\ell}$ of $\vect{x}_{i}$.
+\EndFor
+\State \textbf{Teacher forward (global crops only):}
+       compute $\gT(v_{k,i}^{g})$ for $k\in\{1,2\}$ (no grad).
+\State \textbf{Student forward (all crops):}
+       compute $\gS(v)$ for every crop $v$.
+\State \textbf{Compute loss} $\loss$ via Eq.~\eqref{eq:multicrop}.
+\State \textbf{Backward and update student:}
+       $\thetaS \leftarrow \thetaS - \eta \nabla_{\thetaS} \loss$.
+\State \textbf{Update teacher (EMA):}
+       $\thetaT \leftarrow \lambda\,\thetaT + (1-\lambda)\,\thetaS$.
+\State \textbf{Update center (EMA):}
+       $\vect{c} \leftarrow m\,\vect{c} + (1-m)\,\tfrac{1}{2B}\sum_{i,k} \gT(v_{k,i}^{g})$.
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Emergent Properties}
+
+A striking empirical finding of \citet{caron2021emerging} is that the
+self-attention maps of the final Transformer block in a DINO-trained ViT
+\emph{implicitly segment} the foreground object --- without any
+segmentation supervision. The \texttt{[CLS]} token's attention weights
+over patch tokens, when visualized as a heatmap, produce masks that are
+qualitatively comparable to supervised weakly-supervised segmentation
+methods. This property is absent in supervised ViTs and absent (or much
+weaker) in contrastive methods like SimCLR. It is one of the strongest
+pieces of evidence that the DINO objective induces a representation
+organized around \emph{object semantics} rather than mere discrimination.
+
+\subsection{DINOv2: Patch-Level Objectives, Regularization, and Scale}
+\label{sec:dinov2}
+
+DINOv2~\citep{oquab2024dinov2} retains the DINO skeleton but introduces
+several technical modifications --- individually modest but collectively
+transformative --- along with a much larger, carefully curated pretraining
+dataset (LVD-142M).
+
+\subsubsection{Patch-Level Objective from iBOT}
+
+DINO's loss is computed entirely from the \texttt{[CLS]} token and therefore
+drives the backbone to produce a good \emph{global} representation. Dense
+downstream tasks (segmentation, depth, correspondence) require high-quality
+\emph{patch-level} features. DINOv2 addresses this by incorporating the
+masked-image-modeling objective from iBOT~\citep{zhou2021ibot}.
+
+Let $\vect{u}$ be an augmented view of an image, split into patch tokens
+$\{\vect{u}^{(i)}\}_{i=1}^{N}$. Sample a random subset of indices
+$\mathcal{M} \subset \{1,\ldots,N\}$ to mask. The student receives the
+\emph{masked} view, in which masked patches are replaced by a learnable
+mask token $[\text{MASK}]$; the teacher receives the \emph{unmasked} view.
+Both feed into separate iBOT heads $h^{\text{iBOT}}_{\thetaS}$,
+$h^{\text{iBOT}}_{\thetaT}$ that produce per-patch $K'$-dimensional
+distributions $\tilde{P}_{s}^{(i)}$, $\tilde{P}_{t}^{(i)}$. The iBOT loss
+is
+\begin{equation}
+\loss_{\text{iBOT}} \;=\; - \sum_{i \in \mathcal{M}}
+\sum_{k=1}^{K'} \tilde{P}_{t}^{(i),k} \, \log \tilde{P}_{s}^{(i),k}.
+\label{eq:ibot}
+\end{equation}
+The teacher sees the full context and produces clean patch predictions;
+the student must reconstruct those predictions for the masked patches
+from the surrounding (visible) tokens. This is a patch-level analogue of
+the \texttt{[CLS]}-level self-distillation in Eq.~\eqref{eq:dino-loss},
+and it turns out to be critical for dense prediction quality: ablations
+in~\citet{oquab2024dinov2} show roughly $3$ mIoU improvement on ADE20K
+when the iBOT term is included.
+
+\subsubsection{Untied Head Weights}
+
+DINO, following iBOT, originally used the same projection head for both
+the \texttt{[CLS]} and patch objectives. DINOv2 \emph{unties} them: separate
+heads $h^{\text{DINO}}$ and $h^{\text{iBOT}}$ are used for the two losses.
+This small change delivers measurable gains and reflects the fact that the
+two objectives require different output spaces.
+
+\subsubsection{Sinkhorn--Knopp Centering}
+
+DINOv2 replaces the EMA centering of Eq.~\eqref{eq:center} (for the iBOT
+teacher head) with Sinkhorn--Knopp (SK) batch
+normalization~\citep{caron2020unsupervised}. Given a batch of teacher
+outputs $\vect{Y} \in \R^{B \times K}$ (after softmax), SK iteratively
+normalizes $\vect{Y}$ so that its row and column sums match prescribed
+marginals (uniform), yielding a doubly-stochastic
+matrix. Three SK iterations are typically sufficient. Compared to plain
+EMA centering, SK normalization is more aggressive at distributing mass
+across dimensions and better avoids dimensional collapse in the patch-level
+head.
+
+\subsubsection{KoLeo Regularizer}
+
+To prevent the feature distribution from clustering too tightly and to
+encourage a uniform spread of features on the hypersphere,
+\citet{oquab2024dinov2} add the KoLeo regularizer from
+\citet{sablayrolles2018spreading}. For a batch of $\ell_{2}$-normalized
+\texttt{[CLS]} features $\{\hat{\vect{z}}_{i}\}_{i=1}^{B}$, define
+$d_{i} = \min_{j \neq i} \|\hat{\vect{z}}_{i} - \hat{\vect{z}}_{j}\|_{2}$
+as the distance from $\hat{\vect{z}}_{i}$ to its nearest neighbor in the
+batch. The KoLeo loss is
+\begin{equation}
+\loss_{\text{KoLeo}} \;=\; -\frac{1}{B}\sum_{i=1}^{B} \log\bigl(d_{i}\bigr).
+\label{eq:koleo}
+\end{equation}
+The name derives from the Kozachenko--Leonenko nonparametric estimator of
+differential entropy: minimising Eq.~\eqref{eq:koleo} is equivalent to
+maximising a lower bound on the entropy of the feature distribution,
+thereby spreading features out. Empirically,
+\citet{oquab2024dinov2} report that KoLeo improves instance retrieval
+accuracy by more than 8\% on Oxford-M without harming other metrics --- a
+dramatic improvement for a single loss term.
+
+\subsubsection{The Combined DINOv2 Objective}
+
+The full DINOv2 training objective is a weighted sum:
+\begin{equation}
+\loss_{\text{DINOv2}}
+\;=\;
+\loss_{\text{DINO}}^{\text{mc}}
+\;+\;
+\alpha_{\text{iBOT}}\, \loss_{\text{iBOT}}
+\;+\;
+\alpha_{\text{KoLeo}}\, \loss_{\text{KoLeo}},
+\label{eq:dinov2-total}
+\end{equation}
+with the coefficients $\alpha$ tuned empirically. All three terms act on
+the same student, which is trained jointly; the teachers for the DINO
+and iBOT heads are separate EMAs.
+
+\subsubsection{Curated Data and Training-at-Scale Engineering}
+
+Beyond objective changes, DINOv2's headline contribution is its curated
+pretraining dataset LVD-142M (142 million images, built by retrieving
+images from a large web pool that are close, in embedding space, to
+images from curated sources like ImageNet-22k and Google Landmarks).
+The authors argue --- and their results show --- that curated data is
+dramatically more sample-efficient than uncurated web crawl: a DINOv2
+model trained on 142M curated images outperforms a comparable model
+trained on a larger uncurated pool.
+
+Training at this scale also demanded engineering work: a custom
+memory-efficient FlashAttention, Fully Sharded Data Parallel, sequence
+packing, and stochastic depth. High-resolution adaptation is applied
+for a short period ($\approx 518\times 518$) at the end of pretraining,
+significantly improving performance on dense tasks.
+
+\subsection{DINOv3: Gram Anchoring, High-Resolution Refinement, and Beyond}
+\label{sec:dinov3}
+
+DINOv3~\citep{simeoni2025dinov3} scales the recipe by another order of
+magnitude --- 1.7B images, a 7B-parameter ViT --- but more importantly
+addresses a newly-identified failure mode of very long SSL schedules.
+
+\subsubsection{The Dense Feature Degradation Problem}
+
+When the student ViT is trained for very many iterations on massive data,
+\citet{simeoni2025dinov3} observe an asymmetry: global-feature benchmarks
+(classification, retrieval) continue to improve, but dense-feature
+benchmarks (segmentation mIoU, depth RMSE, cosine-similarity-map sharpness)
+\emph{degrade}. Visually, the patch-to-patch cosine-similarity maps lose
+locality: a query patch no longer correlates strongly with its spatial
+neighbors. The underlying cause, as the authors argue, is that the
+\texttt{[CLS]}-oriented DINO loss eventually dominates the patch-level
+iBOT loss, and patch features begin to ``collapse toward'' the global
+representation.
+
+\subsubsection{Gram Anchoring}
+
+Gram anchoring is a surprisingly elegant remedy. Rather than regularizing
+the patch features themselves (which might interfere with the main
+objectives), DINOv3 regularizes their \emph{pairwise similarity structure}.
+
+Let $\vect{X}_{S} \in \R^{N \times d}$ be the student's $\ell_{2}$-normalized
+patch features for a global crop, with $N$ patches and feature dimension
+$d$. The \emph{Gram matrix}
+$\vect{G}_{S} = \vect{X}_{S}\vect{X}_{S}\trans \in \R^{N \times N}$
+records the pairwise patch--patch cosine similarities. Let $\vect{X}_{G}$
+be the corresponding patch features produced by a \emph{Gram teacher} ---
+a snapshot of the EMA teacher taken at an earlier checkpoint, \emph{before}
+the dense-feature degradation set in (typically around iteration 200k).
+The Gram anchoring loss is
+\begin{equation}
+\loss_{\text{Gram}} \;=\; \bigl\| \vect{X}_{S}\vect{X}_{S}\trans \;-\; \vect{X}_{G}\vect{X}_{G}\trans \bigr\|_{F}^{2},
+\label{eq:gram}
+\end{equation}
+i.e.\ the squared Frobenius norm between the current and reference Gram
+matrices. The Gram teacher is refreshed periodically (every 10k iterations)
+to keep pace with the main teacher.
+
+The geometric interpretation is direct: the loss forces the student to
+preserve the \emph{arrangement} of patches in feature space, even if the
+features themselves continue to evolve. If early in training patch
+$i$ was similar to patch $j$ and dissimilar from patch $k$, that
+similarity structure is retained. Locality is preserved; global
+discrimination is not impeded.
+
+\subsubsection{High-Resolution Refinement}
+
+DINOv3 further uses a \emph{high-resolution Gram teacher}: the Gram teacher
+processes images at $2\times$ the student's resolution, then downsamples
+its patch feature map spatially to match the student's patch grid
+before computing the Gram matrix. This distills the fine spatial structure
+available at high resolution into the standard-resolution student, giving
+an additional boost (approximately $+2$ mIoU on ADE20K).
+
+A subsequent short \emph{high-resolution adaptation} phase mixes global
+crops at $\{512,768\}$ and local crops at $\{112,168,224,336\}$ for
+$\sim\!10$k iterations, improving robustness across inference resolutions
+--- essential for downstream use on high-resolution imagery (remote
+sensing, medical).
+
+\subsubsection{Axial Rotary Positional Embeddings}
+
+DINO and DINOv2 used learnable absolute positional embeddings, interpolated
+at inference for different resolutions. DINOv3 replaces them with axial
+\emph{rotary positional embeddings} (RoPE)~\citep{su2024roformer}, applied
+separately to the $x$ and $y$ axes. RoPE is a \emph{relative} encoding: the
+attention score between two tokens depends only on their relative
+$(\Delta x, \Delta y)$ displacement, not on absolute positions. This
+yields far better generalization across input resolutions and aspect
+ratios. \citet{simeoni2025dinov3} further introduce \emph{RoPE jittering}
+(random perturbation of the coordinates during training) as a
+regularizer.
+
+\subsubsection{The Complete DINOv3 Objective and Training Stages}
+
+After the main training stage (with loss
+Eq.~\eqref{eq:dinov2-total}) has produced the degraded late checkpoint,
+a \emph{refinement} stage minimises
+\begin{equation}
+\loss_{\text{DINOv3}}^{\text{refine}}
+\;=\;
+\loss_{\text{DINOv2}}
+\;+\;
+\alpha_{\text{Gram}}\, \loss_{\text{Gram}}
+\label{eq:dinov3-refine}
+\end{equation}
+for approximately $100$--$200$k additional iterations. This is followed by
+high-resolution adaptation and multi-student distillation into smaller
+variants (ViT-S/B/L/H and a ConvNeXt distillate).
+
+\subsubsection{Summary of the Evolutionary Arc}
+
+Table~\ref{tab:dino-evolution} summarizes the key differences across the
+three generations.
+
+\begin{table}[H]
+\centering\small
+\caption{Evolution of the DINO family. Parameter counts refer to the
+largest publicly released variant.}
+\label{tab:dino-evolution}
+\begin{tabular}{@{}p{3.2cm}p{3.5cm}p{3.5cm}p{3.5cm}@{}}
+\toprule
+ & \textbf{DINO} (2021) & \textbf{DINOv2} (2023) & \textbf{DINOv3} (2025) \\
+\midrule
+Backbone & ViT-B/8 (86M) & ViT-g/14 ($\sim$1.1B) & ViT-7B/16 (6.7B) \\
+Pretrain data & ImageNet-1k & LVD-142M (curated) & LVD-1689M ($\sim$1.7B) \\
+Image-level loss & DINO self-dist.\ (Eq.~\ref{eq:dino-loss}) & DINO + untied heads & same \\
+Patch-level loss & --- & iBOT (Eq.~\ref{eq:ibot}) & iBOT \\
+Regularization & Centering + sharpening & + KoLeo (Eq.~\ref{eq:koleo}), Sinkhorn--Knopp & + Gram anchoring (Eq.~\ref{eq:gram}) \\
+Positional enc.\ & Learnable abs. & Learnable abs. + hi-res adapt. & Axial RoPE + jittering \\
+Notable property & Emergent attn.\ seg. & SOTA linear probes & Stable dense features \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Takeaways for This Project}
+
+Two observations frame the rest of the report:
+
+\begin{enumerate}[leftmargin=*]
+  \item \emph{The DINO family's design decisions are not ornamental.}
+  Each component --- multi-crop, EMA teacher, centering/sharpening, iBOT,
+  KoLeo, Gram anchoring --- addresses a specific failure mode. Understanding
+  them is what enables sound choices during adaptation.
+  \item \emph{Full retraining is not realistic for our project.}
+  DINOv3 was trained with a 7B-parameter ViT on $\sim 1.7$B images for
+  $\sim$1M iterations. Our from-scratch exercise (Part~II) is therefore
+  deliberately scoped as a pedagogical reimplementation on a small
+  dataset; production-level adaptation uses the publicly released
+  DINOv2 checkpoints as a frozen backbone.
+\end{enumerate}
+
+% =============================================================================
+% CHAPTER 3: FEATURE ANALYSIS OF PRETRAINED DINOv2
+% =============================================================================
+\newpage
+\section{Feature Analysis of the Pretrained DINOv2 Backbone}
+\label{ch:analysis}
+
+\noindent\fbox{\parbox{\textwidth}{\small \textbf{Note.} This chapter
+describes the feature-analysis protocol and the qualitative and
+quantitative probes we apply to the publicly released DINOv2 backbone.
+Figures and numerical results are placeholders at this stage and will be
+filled in with the outputs of notebook
+\texttt{01\_dino\_feature\_exploration.ipynb} once Part~II is run.
+Placeholders are highlighted in gray.}}
+\vspace{1em}
+
+\subsection{Objectives}
+
+The goals of this chapter are:
+\begin{enumerate}[leftmargin=*,label=(G\arabic*)]
+\item \label{g:verify} Empirically verify that the pretrained DINOv2
+features exhibit the qualitative properties claimed in the
+literature --- semantically coherent attention, clean PCA components,
+and strong nearest-neighbor structure.
+\item \label{g:diagnose} Diagnose which layers, tokens, and pooling
+strategies yield the strongest features for (a) global image retrieval
+and (b) dense patch-level correspondence --- directly relevant design
+choices for our VPR adaptation in Part~III.
+\item \label{g:baseline} Establish quantitative baselines (kNN
+classification accuracy, zero-shot segmentation mIoU, patch
+correspondence accuracy) against which we can later measure the effect
+of adaptation methods.
+\end{enumerate}
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\paragraph{Model.} We use the officially released
+\texttt{facebook/dinov2-base} backbone (ViT-B/14, 86.6M parameters, patch
+size $14$, embedding dimension $d=768$, $L=12$ transformer blocks) as
+our primary model, with \texttt{facebook/dinov2-small} (ViT-S/14) used as
+a smaller-scale control. All experiments use frozen weights --- no
+finetuning, no adapters --- since the goal is to characterize the
+pretrained representation itself.
+
+\paragraph{Datasets.} We use three small, publicly available datasets to
+keep all experiments runnable on a single commodity GPU:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{ImageNet-100} (100 classes, 50k train / 5k val) for
+  classification probing;
+  \item \textbf{PASCAL VOC 2012} validation split for zero-shot
+  segmentation;
+  \item A hand-curated set of $\sim$50 images sampled from Pitts30k and
+  MSLS for qualitative VPR-relevant visualizations (attention maps,
+  dense feature PCA).
+\end{itemize}
+
+\paragraph{Preprocessing.} Images are resized such that the shorter side
+is $224$ pixels (or $518$ for high-resolution variants), center-cropped,
+and normalized with the ImageNet mean and standard deviation.
+
+\subsection{Qualitative Probes}
+
+\subsubsection{Patch-Feature Principal Components}
+
+A well-known visualization for DINOv2 features consists in running PCA on
+the set of patch features $\{\vect{z}_{L}^{(i)}\}_{i=1}^{N}$ of a single
+image, retaining the top three components, and interpreting them as an
+RGB image~\citep{oquab2024dinov2}. If the features are semantically
+structured, regions belonging to the same object class should map to
+similar colors.
+
+\begin{figure}[H]
+  \centering
+  \placeholder{3$\times$3 grid: three query images on the left, their
+  top-3 PCA visualizations of patch features in the middle column, and
+  foreground masks obtained by thresholding the first PCA component on
+  the right.}
+  \caption{Patch-feature PCA visualization (placeholder).
+  \textbf{Expected observation:} foreground objects should appear as
+  coherent color blobs distinct from background, and the first PCA
+  component typically separates foreground from background cleanly
+  --- a property exploited by several downstream segmentation methods.}
+  \label{fig:pca}
+\end{figure}
+
+\subsubsection{Attention Maps of the Final Block}
+
+We extract the attention weights from the \texttt{[CLS]} token over all
+patch tokens in each of the $H$ heads of the final Transformer block,
+visualize them as heatmaps, and compare across heads.
+
+\begin{figure}[H]
+  \centering
+  \placeholder{Grid of attention-map visualizations: for 4 query images,
+  show 6 attention maps (one per head of the final block) overlaid on
+  the input.}
+  \caption{Final-block \texttt{[CLS]} attention maps (placeholder).
+  \textbf{Expected observation:} in DINO/DINOv2, different attention
+  heads attend to different semantic parts of the image (e.g., one head
+  to the animal's body, another to its head, a third to the ground).
+  This is the emergent-segmentation property discussed in
+  Section~\ref{sec:dino}.}
+  \label{fig:attn}
+\end{figure}
+
+\subsubsection{Patch-to-Patch Cosine Similarity Maps}
+
+For a chosen query patch $q$, we compute the cosine similarity of
+$\vect{z}_{L}^{(q)}$ with every other patch $\vect{z}_{L}^{(i)}$ in a
+\emph{different} image, and visualize the resulting similarity map.
+
+\begin{figure}[H]
+  \centering
+  \placeholder{Pair of images with a query pixel marked on the left
+  image; heatmap overlay on the right image shows cosine similarity of
+  every patch to the query patch. Repeat for 4 query--target pairs.}
+  \caption{Dense patch-to-patch similarity across images (placeholder).
+  \textbf{Expected observation:} the similarity map concentrates on the
+  same semantic part in the target image (e.g., a query on a dog's ear
+  lights up the dog's ear in the target). This is directly the mechanism
+  that training-free VPR methods like
+  EffoVPR~\citep{tzachor2024effovpr} exploit for re-ranking.}
+  \label{fig:patch-sim}
+\end{figure}
+
+\subsection{Quantitative Probes}
+
+\subsubsection{Linear and kNN Classification on ImageNet-100}
+
+We evaluate global \texttt{[CLS]} features by two standard protocols:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Linear probe:} train a single linear classifier
+  $\vect{W} \in \R^{C \times d}$ on top of frozen \texttt{[CLS]} features
+  for 100 epochs with SGD.
+  \item \textbf{kNN:} for each validation feature, retrieve the $k=20$
+  nearest training features (cosine distance) and vote for the class.
+  No training.
+\end{itemize}
+
+\begin{table}[H]
+\centering
+\caption{Classification on ImageNet-100 with frozen DINOv2 features (placeholder).}
+\label{tab:classif}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Model & Probe & Top-1 (\%) & Top-5 (\%) \\
+\midrule
+DINOv2-S/14 & Linear & \placeholder{--} & \placeholder{--} \\
+DINOv2-S/14 & kNN ($k=20$) & \placeholder{--} & \placeholder{--} \\
+DINOv2-B/14 & Linear & \placeholder{--} & \placeholder{--} \\
+DINOv2-B/14 & kNN ($k=20$) & \placeholder{--} & \placeholder{--} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Expected outcome:} linear probe will exceed kNN by $\sim$2--4\%
+top-1. ViT-B will outperform ViT-S by a similar margin. Top-1 accuracy
+should fall in the 85--90\% range, confirming that the frozen features
+are already highly linearly separable.
+
+\subsubsection{Layer-Wise Feature Quality}
+
+A practically important question for adaptation is \emph{which layer's
+features are best} for a given task. We extract \texttt{[CLS]} features
+from every Transformer block $\ell = 1,\ldots,L$ and evaluate each with
+a kNN probe on ImageNet-100. We repeat the analysis for patch features
+using a dense cosine-similarity retrieval task.
+
+\begin{figure}[H]
+  \centering
+  \placeholder{Line chart: x-axis = Transformer block index (1--12);
+  y-axis = kNN top-1 (\%); two curves, one for global \texttt{[CLS]}
+  features and one for pooled patch features.}
+  \caption{Layer-wise feature quality (placeholder).
+  \textbf{Expected observation:} \texttt{[CLS]}-token quality peaks at
+  the last layer or the penultimate layer; patch features may peak
+  slightly earlier. The gap tells us which layers to tap for the VPR
+  adapter --- this directly informs our implementation in Part~III.}
+  \label{fig:layerwise}
+\end{figure}
+
+\subsubsection{Zero-Shot Segmentation on PASCAL VOC}
+
+We apply $k$-means clustering ($k = C + 1$, where $C$ is the number of
+VOC classes) to the set of patch features across the validation split,
+then match clusters to ground-truth classes via Hungarian assignment
+and compute mIoU. This is a classical probe for dense-feature quality.
+
+\begin{table}[H]
+\centering
+\caption{Zero-shot segmentation on PASCAL VOC val (placeholder).}
+\label{tab:seg}
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model & Feature extracted from & mIoU (\%) \\
+\midrule
+DINOv2-B/14 & Last-block patch tokens & \placeholder{--} \\
+DINOv2-B/14 & Mean of last 4 blocks   & \placeholder{--} \\
+DINOv2-B/14 & Final-block K projections & \placeholder{--} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Expected outcome:} mid-40s mIoU, with multi-layer averaging
+yielding 2--3 point improvements over single-layer features. Using
+internal-attention $K$-projections (à la EffoVPR) may yield sharper
+boundaries than direct patch tokens.
+
+\subsubsection{Image Retrieval Probe on a Small VPR Sample}
+
+As an early diagnostic for our VPR experiments, we take a small subset
+of Pitts30k queries and references, extract DINOv2 global descriptors
+(last-block \texttt{[CLS]} token, $\ell_{2}$-normalized), and measure
+Recall@1 on the subset.
+
+\begin{table}[H]
+\centering
+\caption{Zero-shot VPR diagnostic on Pitts30k subset (placeholder).}
+\label{tab:vpr-diag}
+\begin{tabular}{@{}lc@{}}
+\toprule
+Descriptor & Recall@1 (\%) \\
+\midrule
+DINOv2-B/14 \texttt{[CLS]} (last layer)         & \placeholder{--} \\
+DINOv2-B/14 GeM-pooled patch tokens (last layer)  & \placeholder{--} \\
+DINOv2-B/14 mean-pooled patch tokens              & \placeholder{--} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Expected outcome:} out-of-the-box features already yield a
+non-trivial Recall@1 on Pitts30k (literature suggests 60--75\%
+depending on pooling choice) --- a strong motivation for our frozen
+baseline in Part~III.
+
+\subsection{Planned Analyses and Report-Back}
+
+Once Part~II is complete, we will return to this chapter and replace all
+placeholders with the actual figures and numerical values. A brief
+analytical discussion of each result will be added, including:
+\begin{itemize}[leftmargin=*]
+\item which quantitative observations matched our a priori expectations
+based on the literature;
+\item which observations did not, and a hypothesis for why;
+\item the implications for the VPR adaptation choices in Part~III.
+\end{itemize}
+
+\subsection{Summary of Part I}
+
+We have introduced the setting and motivation (Chapter~\ref{ch:intro}),
+derived the DINO family in full mathematical detail
+(Chapter~\ref{ch:dino}), and laid out the feature-analysis protocol we
+will execute in Part~II (this chapter). Part~II will add: the
+mini-reimplementation of the DINO training loop on CIFAR-100 /
+Tiny-ImageNet, and the numerical completion of the present chapter.
+Part~III will add the VPR adaptation experiments and the empirical
+comparison of multiple adaptation strategies.
+
+% =============================================================================
+% BIBLIOGRAPHY
+% =============================================================================
+\newpage
+\bibliography{references}
+
+\end{document}

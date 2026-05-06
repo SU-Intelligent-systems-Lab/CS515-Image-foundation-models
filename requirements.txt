@@ -1,0 +1,33 @@
+# Core PyTorch stack
+# NOTE: Install torch/torchvision with the correct CUDA build from pytorch.org
+# before installing the rest, e.g.:
+#   pip install torch==2.1.* torchvision==0.16.* --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+torchvision>=0.16
+numpy>=1.24
+pillow>=10.0
+
+# Pretrained models
+transformers>=4.40
+timm>=0.9.12
+
+# Training utilities
+einops>=0.7
+tqdm>=4.66
+
+# Configuration / logging
+pyyaml>=6.0
+tensorboard>=2.15
+
+# Analysis & plotting
+matplotlib>=3.8
+scikit-learn>=1.3
+scipy>=1.11
+
+# Notebooks
+jupyterlab>=4.0
+ipywidgets>=8.0
+
+# Dev (optional)
+pytest>=7.4
+pytest-cov>=4.1
