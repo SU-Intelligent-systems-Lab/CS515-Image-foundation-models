@@ -1,0 +1,26 @@
+# Linear probe segmentation on Pascal VOC 2012
+# Reproduces DINOv3 Paper Section 6.1.2 (Table 3)
+#
+# Expected result with ViT-L/16: ~85+ mIoU (extrapolated from paper)
+# Paper result with ViT-7B/16:    86.6 mIoU
+
+dataset_name: "voc"
+dataset_root: "data/VOCdevkit/VOC2012"
+num_classes: 21
+
+backbone_name: "vitl16"
+weights_path: "weights/dinov3_vitl16.pth"
+autocast_dtype: "float32"
+
+batch_size: 2
+total_iterations: 20000       # VOC is smaller, fewer iterations needed
+learning_rate: 1e-3
+weight_decay: 1e-3
+warmup_iterations: 1000
+
+eval_interval: 2500
+eval_crop_size: 512
+eval_stride: 341
+img_size: 512
+
+output_dir: "results/linear_probe/voc_vitl16"
